@@ -2,9 +2,19 @@ import json
 import re
 import sqlite3
 import html
+import hashlib
+import hmac
+import secrets
+import ssl
 import urllib.request
+from urllib.parse import urlparse
 from datetime import date, datetime
 from pathlib import Path
+
+try:
+    import certifi
+except ImportError:
+    certifi = None
 
 import streamlit as st
 
@@ -16,10 +26,26 @@ STATUSES = ["Applied / Waiting for update", "Saved", "Interviewing", "Offer", "R
 ACTIVE_STATUSES = ["Applied / Waiting for update", "Saved", "Interviewing", "Offer"]
 
 
+def request_ssl_context():
+    """Use certifi when the macOS Python install lacks its root certificates."""
+    if certifi:
+        return ssl.create_default_context(cafile=certifi.where())
+    return ssl.create_default_context()
+
+
 def db():
     DATA_DIR.mkdir(exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            password_hash TEXT NOT NULL,
+            password_salt TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )"""
+    )
     conn.execute(
         """CREATE TABLE IF NOT EXISTS opportunities (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -50,6 +76,7 @@ def db():
     )
     existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(opportunities)").fetchall()}
     migrations = {
+        "user_id": "ALTER TABLE opportunities ADD COLUMN user_id INTEGER",
         "job_description": "ALTER TABLE opportunities ADD COLUMN job_description TEXT NOT NULL DEFAULT ''",
         "date_opened": "ALTER TABLE opportunities ADD COLUMN date_opened TEXT NOT NULL DEFAULT ''",
         "heard_back_follow_up": "ALTER TABLE opportunities ADD COLUMN heard_back_follow_up TEXT NOT NULL DEFAULT ''",
@@ -70,18 +97,90 @@ def db():
     return conn
 
 
-def load_rows(conn):
-    return [dict(r) for r in conn.execute("SELECT * FROM opportunities ORDER BY CASE status WHEN 'Offer' THEN 1 WHEN 'Interviewing' THEN 2 WHEN 'Applied / Waiting for update' THEN 3 WHEN 'Saved' THEN 4 WHEN 'Rejected' THEN 5 ELSE 6 END, COALESCE(deadline, '9999-12-31')").fetchall()]
+def password_digest(password, salt):
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 240_000).hex()
 
 
-def save_opportunity(conn, payload, row_id=None):
+def create_user(conn, username, password):
+    username = username.strip()
+    if len(username) < 3:
+        return None, "Username must be at least 3 characters."
+    if len(password) < 8:
+        return None, "Password must be at least 8 characters."
+    salt = secrets.token_hex(16)
+    try:
+        with conn:
+            cursor = conn.execute(
+                "INSERT INTO users (username, password_hash, password_salt, created_at) VALUES (?, ?, ?, ?)",
+                (username, password_digest(password, salt), salt, datetime.now().isoformat(timespec="seconds")),
+            )
+            user_id = cursor.lastrowid
+            # Preserve existing local/demo records for the first account.
+            if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 1:
+                conn.execute("UPDATE opportunities SET user_id=? WHERE user_id IS NULL", (user_id,))
+        return user_id, ""
+    except sqlite3.IntegrityError:
+        return None, "That username is already in use."
+
+
+def authenticate_user(conn, username, password):
+    row = conn.execute("SELECT * FROM users WHERE username=? COLLATE NOCASE", (username.strip(),)).fetchone()
+    if not row:
+        return None
+    candidate = password_digest(password, row["password_salt"])
+    return dict(row) if hmac.compare_digest(candidate, row["password_hash"]) else None
+
+
+def auth_gate(conn):
+    if st.session_state.get("user_id"):
+        return True
+    st.markdown('<div class="hero"><h1>JobTracker</h1><p>Sign in to keep your job search private.</p></div>', unsafe_allow_html=True)
+    login_tab, signup_tab = st.tabs(["Log in", "Create account"])
+    with login_tab:
+        with st.form("login-form"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Log in", type="primary", use_container_width=True)
+        if submitted:
+            user = authenticate_user(conn, username, password)
+            if user:
+                st.session_state["user_id"] = user["id"]
+                st.session_state["username"] = user["username"]
+                st.rerun()
+            else:
+                st.error("Username or password is incorrect.")
+    with signup_tab:
+        with st.form("signup-form"):
+            username = st.text_input("Choose a username")
+            password = st.text_input("Choose a password", type="password")
+            confirm = st.text_input("Confirm password", type="password")
+            submitted = st.form_submit_button("Create account", type="primary", use_container_width=True)
+        if submitted:
+            if password != confirm:
+                st.error("The passwords do not match.")
+            else:
+                user_id, error = create_user(conn, username, password)
+                if error:
+                    st.error(error)
+                else:
+                    st.session_state["user_id"] = user_id
+                    st.session_state["username"] = username.strip()
+                    st.rerun()
+    return False
+
+
+def load_rows(conn, user_id):
+    return [dict(r) for r in conn.execute("SELECT * FROM opportunities WHERE user_id=? ORDER BY CASE status WHEN 'Offer' THEN 1 WHEN 'Interviewing' THEN 2 WHEN 'Applied / Waiting for update' THEN 3 WHEN 'Saved' THEN 4 WHEN 'Rejected' THEN 5 ELSE 6 END, COALESCE(deadline, '9999-12-31')", (user_id,)).fetchall()]
+
+
+def save_opportunity(conn, payload, user_id, row_id=None):
     now = datetime.now().isoformat(timespec="seconds")
     fields = ["company", "title", "link", "location", "deadline", "status", "priority", "next_action", "next_action_due", "source", "network_contact", "resume_version", "cover_letter_version", "job_description", "date_opened", "heard_back_follow_up", "second_final_interview_date", "interview_date", "thank_you_sent", "notes", "last_email_event"]
     values = [payload.get(f, "") for f in fields]
     if row_id:
-        conn.execute("UPDATE opportunities SET " + ", ".join(f"{f}=?" for f in fields) + ", updated_at=? WHERE id=?", values + [now, row_id])
+        conn.execute("UPDATE opportunities SET " + ", ".join(f"{f}=?" for f in fields) + ", updated_at=? WHERE id=? AND user_id=?", values + [now, row_id, user_id])
     else:
-        conn.execute("INSERT INTO opportunities (" + ",".join(fields) + ",created_at,updated_at) VALUES (" + ",".join("?" for _ in fields) + ",?,?)", values + [now, now])
+        conn.execute("INSERT INTO opportunities (user_id," + ",".join(fields) + ",created_at,updated_at) VALUES (?," + ",".join("?" for _ in fields) + ",?,?)", [user_id] + values + [now, now])
     conn.commit()
 
 
@@ -94,25 +193,97 @@ def parse_date(value):
 
 def import_job_link(url, status="Applied / Waiting for update"):
     """Read available job metadata from a real posting page; never invent fields."""
-    request = urllib.request.Request(url.strip(), headers={"User-Agent": "Mozilla/5.0 JobTracker"})
-    with urllib.request.urlopen(request, timeout=8) as response:
+    clean_url = url.strip()
+    parsed_url = urlparse(clean_url)
+
+    # Workday career pages render their content in the browser. Their public CXS
+    # endpoint exposes the same posting data without requiring JavaScript.
+    if parsed_url.hostname and parsed_url.hostname.endswith(".myworkdayjobs.com"):
+        path_parts = [part for part in parsed_url.path.split("/") if part]
+        if len(path_parts) >= 3:
+            tenant = parsed_url.hostname.split(".")[0]
+            site = path_parts[0]
+            job_id = path_parts[-1]
+            api_url = f"{parsed_url.scheme}://{parsed_url.netloc}/wday/cxs/{tenant}/{site}/job/{job_id}"
+            api_request = urllib.request.Request(api_url, data=b"{}", method="POST", headers={
+                "User-Agent": "Mozilla/5.0 JobTracker",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Origin": f"{parsed_url.scheme}://{parsed_url.netloc}",
+            })
+            try:
+                with urllib.request.urlopen(api_request, timeout=10, context=request_ssl_context()) as response:
+                    workday = json.loads(response.read(800000).decode("utf-8", "ignore"))
+                info = workday.get("jobPostingInfo", workday)
+                if isinstance(info, dict):
+                    location = info.get("location", "")
+                    if isinstance(location, dict):
+                        location = ", ".join(str(location.get(k, "")) for k in ("city", "state", "country") if location.get(k))
+                    elif isinstance(location, list):
+                        location = ", ".join(str(item) for item in location)
+                    description = info.get("jobDescription", info.get("description", "")) or ""
+                    description = re.sub(r"<\s*br\s*/?>|</\s*(p|div|h[1-6])\s*>", "\n\n", description, flags=re.I)
+                    description = re.sub(r"<\s*li[^>]*>", "\n• ", description, flags=re.I)
+                    description = re.sub(r"</\s*li\s*>", "\n", description, flags=re.I)
+                    description = re.sub(r"<[^>]+>", "", html.unescape(str(description)))
+                    return dict(
+                        company=str(info.get("company", info.get("hiringOrganization", "")) or ""),
+                        title=str(info.get("title", "") or ""), link=clean_url,
+                        location=str(location), deadline=str(info.get("endDate", info.get("validThrough", "")) or "")[:10],
+                        date_opened=str(info.get("startDate", info.get("datePosted", "")) or "")[:10],
+                        status=status, priority="Medium", next_action="Follow up on application",
+                        next_action_due=date.today().isoformat(), source="Imported from posting link",
+                        network_contact="", resume_version="", cover_letter_version="",
+                        job_description=description[:12000], interview_date="", thank_you_sent=0,
+                        notes="", last_email_event="", heard_back_follow_up="", second_final_interview_date=""
+                    )
+            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError):
+                pass
+
+    request = urllib.request.Request(clean_url, headers={
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131.0 Safari/537.36 JobTracker",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    with urllib.request.urlopen(request, timeout=8, context=request_ssl_context()) as response:
         page = response.read(800000).decode("utf-8", "ignore")
-    scripts = re.findall(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', page, re.I | re.S)
+
+    def json_items(value):
+        if isinstance(value, list):
+            for item in value:
+                yield from json_items(item)
+        elif isinstance(value, dict):
+            yield value
+            for item in value.get("@graph", []):
+                yield from json_items(item)
+
     structured = {}
+    scripts = re.findall(r'<script\b[^>]*type\s*=\s*["\']application/ld\+json\s*["\'][^>]*>(.*?)</script\s*>', page, re.I | re.S)
     for script in scripts:
         try:
             candidate = json.loads(html.unescape(script.strip()))
-            items = candidate if isinstance(candidate, list) else [candidate]
-            for item in items:
-                if isinstance(item, dict) and (item.get("@type") == "JobPosting" or "JobPosting" in item.get("@type", [])):
+            for item in json_items(candidate):
+                item_type = item.get("@type", [])
+                if item_type == "JobPosting" or (isinstance(item_type, list) and "JobPosting" in item_type):
                     structured = item
                     break
         except (ValueError, TypeError):
             continue
+
     def meta(pattern):
         match = re.search(pattern, page, re.I | re.S)
         return html.unescape(match.group(1)).strip() if match else ""
-    title = structured.get("title", "") or meta(r'<meta[^>]+(?:property|name)=["\'](?:og:title|twitter:title)["\'][^>]+content=["\'](.*?)["\']') or meta(r"<title[^>]*>(.*?)</title>")
+
+    def meta_content(*names):
+        names_re = "|".join(re.escape(name) for name in names)
+        for tag in re.findall(r"<meta\b[^>]*>", page, re.I | re.S):
+            name_match = re.search(r"(?:property|name)\s*=\s*[\"']([^\"']+)[\"']", tag, re.I)
+            content_match = re.search(r"content\s*=\s*[\"'](.*?)[\"']", tag, re.I | re.S)
+            if name_match and content_match and re.fullmatch(names_re, name_match.group(1).strip(), re.I):
+                return html.unescape(content_match.group(1)).strip()
+        return ""
+
+    title = structured.get("title", "") or meta_content("og:title", "twitter:title") or meta(r"<title[^>]*>(.*?)</title>")
     company = structured.get("hiringOrganization", {})
     company = company.get("name", "") if isinstance(company, dict) else ""
     location = structured.get("jobLocation", {})
@@ -122,7 +293,7 @@ def import_job_link(url, status="Applied / Waiting for update"):
     location_text = ", ".join(str(address.get(k, "")) for k in ("addressLocality", "addressRegion", "addressCountry") if address.get(k)) if isinstance(address, dict) else ""
     if structured.get("jobLocationType") == "TELECOMMUTE":
         location_text = "Remote" + (f" · {location_text}" if location_text else "")
-    description = structured.get("description", "") or meta(r'<meta[^>]+(?:property|name)=["\'](?:og:description|description)["\'][^>]+content=["\'](.*?)["\']')
+    description = structured.get("description", "") or meta_content("og:description", "description")
     description = html.unescape(description)
     description = re.sub(r"<\s*br\s*/?>|</\s*(p|div|h[1-6])\s*>", "\n\n", description, flags=re.I)
     description = re.sub(r"<\s*li[^>]*>", "\n• ", description, flags=re.I)
@@ -131,7 +302,7 @@ def import_job_link(url, status="Applied / Waiting for update"):
     description = re.sub(r"\n{3,}", "\n\n", description).strip()
     opened = structured.get("datePosted", "")
     closes = structured.get("validThrough", "")
-    return dict(company=company, title=title, link=url.strip(), location=location_text, deadline=closes[:10] if closes else "", date_opened=opened[:10] if opened else "", status=status, priority="Medium", next_action="Follow up on application", next_action_due=date.today().isoformat(), source="Imported from posting link", network_contact="", resume_version="", cover_letter_version="", job_description=description[:12000], interview_date="", thank_you_sent=0, notes="", last_email_event="", heard_back_follow_up="", second_final_interview_date="")
+    return dict(company=company, title=title, link=clean_url, location=location_text, deadline=closes[:10] if closes else "", date_opened=opened[:10] if opened else "", status=status, priority="Medium", next_action="Follow up on application", next_action_due=date.today().isoformat(), source="Imported from posting link", network_contact="", resume_version="", cover_letter_version="", job_description=description[:12000], interview_date="", thank_you_sent=0, notes="", last_email_event="", heard_back_follow_up="", second_final_interview_date="")
 
 
 def save_uploaded_file(uploaded_file, prefix):
@@ -289,7 +460,7 @@ def dashboard(conn, rows):
             st.markdown(f'<p style="margin:.65rem 0 .2rem"><strong>{html.escape(status)}</strong><span style="float:right">{count}</span></p><div class="progress-track"><div class="progress-fill" style="width:{min(100, count/total*100):.0f}%"></div></div>', unsafe_allow_html=True)
 
 
-def opportunity_form(conn, existing=None, key="form"):
+def opportunity_form(conn, user_id, existing=None, key="form"):
     r = existing or {}
     with st.form(key, clear_on_submit=not existing):
         st.subheader("Edit opportunity" if existing else "Add opportunity")
@@ -326,7 +497,7 @@ def opportunity_form(conn, existing=None, key="form"):
             resume_path = save_uploaded_file(resume_file, f"resume_{company.strip().lower().replace(' ', '_')}") or r.get("resume_version", "")
             cover_path = save_uploaded_file(cover_file, f"cover_letter_{company.strip().lower().replace(' ', '_')}") or r.get("cover_letter_version", "")
             payload = dict(company=company.strip(), title=title.strip(), link=link.strip(), location=location.strip(), deadline=deadline.isoformat(), status=status, priority=priority, next_action=next_action.strip(), next_action_due=next_due.isoformat(), source=source.strip(), network_contact=network_contact.strip(), resume_version=resume_path, cover_letter_version=cover_path, job_description=job_description.strip(), date_opened=r.get("date_opened", ""), heard_back_follow_up=r.get("heard_back_follow_up", ""), second_final_interview_date=r.get("second_final_interview_date", ""), interview_date=r.get("interview_date", ""), thank_you_sent=int(thank_you), notes=notes.strip(), last_email_event=r.get("last_email_event", ""))
-            save_opportunity(conn, payload, r.get("id"))
+            save_opportunity(conn, payload, user_id, r.get("id"))
             st.session_state["next_view"] = "Job spreadsheet"
             st.success("Saved. Opening opportunities.")
             st.rerun()
@@ -337,7 +508,16 @@ def main():
     st.set_page_config(page_title="JobTracker", page_icon="◈", layout="wide")
     css()
     conn = db()
-    rows = load_rows(conn)
+    if not auth_gate(conn):
+        conn.close()
+        return
+    user_id = st.session_state["user_id"]
+    st.sidebar.caption(f"Signed in as **{st.session_state.get('username', '')}**")
+    if st.sidebar.button("Log out", use_container_width=True):
+        st.session_state.pop("user_id", None)
+        st.session_state.pop("username", None)
+        st.rerun()
+    rows = load_rows(conn, user_id)
     st.markdown('<div class="hero"><h1>JobTracker</h1></div>', unsafe_allow_html=True)
     if "next_view" in st.session_state:
         st.session_state["view"] = st.session_state.pop("next_view")
@@ -361,12 +541,13 @@ def main():
                         st.warning("The page loaded but did not expose job fields. Review the link and enter the details manually.")
                     else:
                         st.success("Available job fields imported. Review them before saving.")
-                except Exception:
+                except Exception as exc:
                     st.error("This posting could not be read automatically. Enter the details manually or use another posting link.")
+                    st.caption(f"Reader detail: {exc}")
         if "draft" in st.session_state:
-            opportunity_form(conn, st.session_state["draft"], key="draft-form")
+            opportunity_form(conn, user_id, st.session_state["draft"], key="draft-form")
         else:
-            opportunity_form(conn, key="new-form")
+            opportunity_form(conn, user_id, key="new-form")
 
     elif view == "Job spreadsheet":
         st.subheader("Job spreadsheet")
@@ -500,7 +681,7 @@ def main():
                     st.info("No description saved")
                     pasted_description = st.text_area("Paste job description", height=260, key=f"paste-description-{selected_job['id']}")
                     if st.button("Save description", key=f"save-description-{selected_job['id']}", type="primary"):
-                        conn.execute("UPDATE opportunities SET job_description=?, updated_at=? WHERE id=?", (pasted_description.strip(), datetime.now().isoformat(timespec="seconds"), selected_job["id"]))
+                        conn.execute("UPDATE opportunities SET job_description=?, updated_at=? WHERE id=? AND user_id=?", (pasted_description.strip(), datetime.now().isoformat(timespec="seconds"), selected_job["id"], user_id))
                         conn.commit()
                         st.rerun()
             else:

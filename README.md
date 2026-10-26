@@ -9,6 +9,16 @@ python3 -m pip install -r requirements.txt
 streamlit run app.py
 ```
 
+The app opens with a username/password account screen. Passwords are stored as salted PBKDF2 hashes, and each account sees only its own opportunities.
+
+## Deploy with Streamlit Community Cloud
+
+1. Push this repository to GitHub.
+2. In Streamlit Community Cloud, choose **New app** and select `app.py` from this repository.
+3. Deploy. The app will create its local SQLite database on first use.
+
+For a production deployment, connect the app to a hosted database and persistent file storage. Streamlit Community Cloud can restart apps, so its local SQLite database and uploaded documents should be treated as demo/local storage.
+
 The app stores entries in `data/job_tracker.db` and includes demo data on first launch. Delete that database if you want to start with a blank tracker.
 
 ## Core experience
