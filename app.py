@@ -643,34 +643,39 @@ def main():
                 key="job-spreadsheet",
             )
 
-            edited_rows = edited_table.to_dict("records")
+            if hasattr(edited_table, "to_dict"):
+                edited_rows = edited_table.to_dict("records")
+            elif isinstance(edited_table, list):
+                edited_rows = [dict(row) for row in edited_table]
+            else:
+                edited_rows = []
             changed = False
             for index, edited_row in enumerate(edited_rows):
                 if index < len(filtered) and edited_row.get("Application Status") != filtered[index].get("status"):
                     new_status = edited_row.get("Application Status")
                     if new_status in STATUSES:
-                        conn.execute("UPDATE opportunities SET status=?, updated_at=? WHERE id=?", (new_status, datetime.now().isoformat(timespec="seconds"), filtered[index]["id"]))
+                        conn.execute("UPDATE opportunities SET status=?, updated_at=? WHERE id=? AND user_id=?", (new_status, datetime.now().isoformat(timespec="seconds"), filtered[index]["id"], user_id))
                         changed = True
             if changed:
                 conn.commit()
                 st.rerun()
 
-        selected_index = 0
-        if filtered:
-            selected_index = min(selected_index, len(filtered) - 1)
-            selected_job = filtered[selected_index]
-        else:
-            selected_job = None
-
         with right.container(key="description-panel", height=700):
-            if selected_job:
+            if filtered:
+                selected_index = st.selectbox(
+                    "View job details",
+                    options=list(range(len(filtered))),
+                    format_func=lambda index: f"{filtered[index].get('company') or 'Company'} — {filtered[index].get('title') or 'Untitled role'}",
+                    key="selected-job-index",
+                )
+                selected_job = filtered[selected_index]
                 st.subheader(selected_job.get("company") or "Company")
                 st.markdown(f"**Role:** {html.escape(selected_job.get('title') or '—')}  \n**Location:** {html.escape(selected_job.get('location') or '—')}  \n**Closes:** {html.escape(close_label(selected_job.get('deadline'))[0])}", unsafe_allow_html=True)
                 if selected_job.get("link"):
                     st.markdown(f"[Open original posting]({selected_job['link']})")
                 status = st.selectbox("Application Status", STATUSES, index=STATUSES.index(selected_job.get("status")) if selected_job.get("status") in STATUSES else 0, key=f"panel-status-{selected_job['id']}")
                 if status != selected_job.get("status"):
-                    conn.execute("UPDATE opportunities SET status=?, updated_at=? WHERE id=?", (status, datetime.now().isoformat(timespec="seconds"), selected_job["id"]))
+                    conn.execute("UPDATE opportunities SET status=?, updated_at=? WHERE id=? AND user_id=?", (status, datetime.now().isoformat(timespec="seconds"), selected_job["id"], user_id))
                     conn.commit()
                     st.rerun()
                 st.markdown("---")
