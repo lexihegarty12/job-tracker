@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Local tracker data and uploaded application documents
+data/job_tracker.db
+data/documents/
