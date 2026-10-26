@@ -409,40 +409,29 @@ def kpi(label, value):
 
 
 def opportunity_card(row):
-    due = days_label(row.get("next_action_due"))
     priority = row.get("priority", "Medium")
     st.markdown(
         f'<div class="task-card"><strong>{html.escape(row.get("company", ""))}</strong> · {html.escape(row.get("title", ""))}'
         f'<p>{html.escape(row.get("next_action") or "Choose the next move")} <span class="tag">{html.escape(priority)}</span></p>'
-        f'<span class="muted">Due {html.escape(due)} · {html.escape(row.get("status", ""))}</span></div>',
+        f'<span class="muted">{html.escape(row.get("status", ""))}</span></div>',
         unsafe_allow_html=True,
     )
 
 
 def dashboard(conn, rows):
-    today = date.today()
     active = [r for r in rows if r.get("status") in ACTIVE_STATUSES]
-    due_soon = [r for r in active if parse_date(r.get("next_action_due", "")) and 0 <= (parse_date(r.get("next_action_due", "")) - today).days <= 7]
     interviews = [r for r in active if r.get("status") == "Interviewing"]
     applications = [r for r in rows if r.get("status") in ("Applied / Waiting for update", "Interviewing", "Offer")]
 
     st.markdown('<div class="hero"><h1>This week</h1></div>', unsafe_allow_html=True)
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     with c1: kpi("Active opportunities", len(active))
-    with c2: kpi("Actions due this week", len(due_soon))
-    with c3: kpi("Interviews in motion", len(interviews))
-    with c4: kpi("Applications sent", len(applications))
+    with c2: kpi("Interviews in motion", len(interviews))
+    with c3: kpi("Applications sent", len(applications))
 
     left, right = st.columns([1.45, 1], gap="large")
     with left:
-        st.markdown('<div class="section-kicker">Your next moves</div>', unsafe_allow_html=True)
-        action_rows = sorted(due_soon, key=lambda r: r.get("next_action_due") or "9999-12-31")
-        if action_rows:
-            for row in action_rows[:8]:
-                opportunity_card(row)
-        else:
-            st.markdown('<div class="empty-card">No actions due in the next 7 days. Add a new opportunity or move a saved role forward.</div>', unsafe_allow_html=True)
         st.markdown('<div class="section-kicker">Quick capture</div>', unsafe_allow_html=True)
         q1, q2 = st.columns(2)
         with q1:
